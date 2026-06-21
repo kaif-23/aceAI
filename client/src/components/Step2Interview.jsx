@@ -12,16 +12,25 @@ import { ServerUrl } from '../App'
 import { BsArrowRight } from 'react-icons/bs'
 
 function Step2Interview({ interviewData, onFinish }) {
-  const { interviewId, questions, userName } = interviewData;
+  const { interviewId, userName, intro, totalTopics } = interviewData;
   const [isIntroPhase, setIsIntroPhase] = useState(true);
 
   const [isMicOn, setIsMicOn] = useState(true);
   const recognitionRef = useRef(null);
   const [isAIPlaying, setIsAIPlaying] = useState(false);
 
+  // The question list now GROWS as the interview proceeds — it starts with only
+  // the first question and gains one more each time submit-answer responds,
+  // since later questions don't exist yet until the AI decides what's next.
+  const [questions, setQuestions] = useState(interviewData.questions || []);
+  const [outro, setOutro] = useState("");
+  const [interviewComplete, setInterviewComplete] = useState(false);
+  const [isFinishing, setIsFinishing] = useState(false);
+
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answer, setAnswer] = useState("");
-  const [feedback, setFeedback] = useState("");
+  const answerRef = useRef("");
+  const [spokenReaction, setSpokenReaction] = useState("");
   const [timeLeft, setTimeLeft] = useState(
     questions[0]?.timeLimit || 60
   );
@@ -30,6 +39,13 @@ function Step2Interview({ interviewData, onFinish }) {
   const [voiceGender, setVoiceGender] = useState("female");
   const [subtitle, setSubtitle] = useState("");
 
+
+  // Keep a ref mirror of `answer` so async code (mic finalization, submit)
+  // always reads the LATEST value instead of a value captured in a stale
+  // closure from an earlier render.
+  useEffect(() => {
+    answerRef.current = answer;
+  }, [answer]);
 
   const videoRef = useRef(null);
 
@@ -143,21 +159,25 @@ function Step2Interview({ interviewData, onFinish }) {
     }
     const runIntro = async () => {
       if (isIntroPhase) {
-        await speakText(
-          `Hi ${userName}, it's great to meet you today. I hope you're feeling confident and ready.`
-        );
+        const introLines = Array.isArray(intro) && intro.length
+          ? intro
+          : [
+              `Hi ${userName}, it's great to meet you today.`,
+              "I'll ask you a few questions. Let's begin."
+            ];
 
-        await speakText(
-          "I'll ask you a few questions. Just answer naturally, and take your time. Let's begin."
-        );
+        for (const line of introLines) {
+          await speakText(line);
+        }
 
         setIsIntroPhase(false)
       } else if (currentQuestion) {
         await new Promise(r => setTimeout(r, 800));
 
-        // If last question (hard level)
-        if (currentIndex === questions.length - 1) {
-          await speakText("Alright, this one might be a bit more challenging.");
+        // Speak this question's transition line (empty for question 1, since
+        // the intro already leads into it) instead of a generic phrase.
+        if (currentQuestion.transition) {
+          await speakText(currentQuestion.transition);
         }
 
         await speakText(currentQuestion.question);
@@ -202,6 +222,10 @@ function Step2Interview({ interviewData, onFinish }) {
 }, [currentIndex]);
 
 
+  // Tracks whether the recognizer is currently active, so stopMicAndWait()
+  // knows whether it actually needs to wait for an onend event at all.
+  const recognitionActiveRef = useRef(false);
+
   useEffect(() => {
     if (!("webkitSpeechRecognition" in window)) return;
 
@@ -214,7 +238,24 @@ function Step2Interview({ interviewData, onFinish }) {
       const transcript =
         event.results[event.results.length - 1][0].transcript;
 
-      setAnswer((prev) => prev + " " + transcript);
+      // Use the functional form of setAnswer so this always builds on the
+      // LATEST state, never a value captured in a stale closure — this is
+      // what makes typing and speaking safe to interleave. We update the ref
+      // from inside the updater itself, so the ref and state can never
+      // disagree with each other even if multiple updates land in the same tick.
+      setAnswer((prev) => {
+        const next = (prev + " " + transcript).trim();
+        answerRef.current = next;
+        return next;
+      });
+    };
+
+    recognition.onstart = () => {
+      recognitionActiveRef.current = true;
+    };
+
+    recognition.onend = () => {
+      recognitionActiveRef.current = false;
     };
 
     recognitionRef.current = recognition;
@@ -235,6 +276,47 @@ function Step2Interview({ interviewData, onFinish }) {
       recognitionRef.current.stop();
     }
   };
+
+  // Stops the mic AND waits for any in-flight speech result to actually land
+  // in answerRef before resolving. webkitSpeechRecognition.stop() does not
+  // discard audio already captured — it finishes processing it and still
+  // fires onresult/onend afterward. Submitting immediately after calling
+  // stop() risks sending an answer that's missing the last few words (or is
+  // still completely empty) because that final result hadn't arrived yet.
+  const stopMicAndWait = () => {
+    return new Promise((resolve) => {
+      if (!recognitionRef.current || !recognitionActiveRef.current) {
+        resolve();
+        return;
+      }
+
+      const recognition = recognitionRef.current;
+      const previousOnEnd = recognition.onend;
+
+      // Give the recognizer a brief grace window to flush a final result
+      // after stop() is called, instead of resolving the instant stop() returns.
+      const settle = () => {
+        recognition.onend = previousOnEnd;
+        setTimeout(resolve, 250);
+      };
+
+      recognition.onend = () => {
+        recognitionActiveRef.current = false;
+        if (previousOnEnd) previousOnEnd();
+        settle();
+      };
+
+      try {
+        recognition.stop();
+      } catch {
+        settle();
+      }
+
+      // Safety net: if onend never fires for some reason, don't hang forever.
+      setTimeout(resolve, 1200);
+    });
+  };
+
   const toggleMic = () => {
     if (isMicOn) {
       stopMic();
@@ -247,20 +329,51 @@ function Step2Interview({ interviewData, onFinish }) {
 
   const submitAnswer = async () => {
     if (isSubmitting) return;
-    stopMic()
     setIsSubmitting(true)
+
+    // Wait for any in-flight speech recognition result to land before reading
+    // the final answer — this is what prevents "I definitely said something
+    // but the report shows no answer" when the user finishes speaking right
+    // as they click Submit.
+    await stopMicAndWait();
+    const finalAnswer = answerRef.current.trim();
+    // Reflect the settled value in the UI too, in case a late result arrived
+    // after the last render but before this point.
+    setAnswer(finalAnswer);
 
     try {
       const result = await axios.post(ServerUrl + "/api/interview/submit-answer", {
         interviewId,
         questionIndex: currentIndex,
-        answer,
+        answer: finalAnswer,
         timeTaken:
           currentQuestion.timeLimit - timeLeft,
       } , {withCredentials:true})
 
-      setFeedback(result.data.feedback)
-      speakText(result.data.feedback)
+      setSpokenReaction(result.data.spokenReaction)
+
+      if (result.data.interviewComplete) {
+        setInterviewComplete(true);
+        const finalOutro = result.data.outro || "";
+        setOutro(finalOutro);
+
+        // Speak the reaction to the final answer, then the outro right after,
+        // back-to-back — this is the "interview is actually over" moment, so
+        // it should feel like one continuous closing, not a reaction followed
+        // by silence until a button click later triggers the outro.
+        (async () => {
+          await speakText(result.data.spokenReaction);
+          if (finalOutro) await speakText(finalOutro);
+        })();
+      } else {
+        speakText(result.data.spokenReaction);
+        if (result.data.nextQuestion) {
+          // The next question (follow-up OR new topic — decided server-side)
+          // is appended now; it didn't exist before this response.
+          setQuestions((prev) => [...prev, result.data.nextQuestion]);
+        }
+      }
+
       setIsSubmitting(false)
     } catch (error) {
 console.log(error)
@@ -268,28 +381,35 @@ setIsSubmitting(false)
     }
   }
 
-  const handleNext =async () => {
-    setAnswer("");
-    setFeedback("");
-
-    if (currentIndex + 1 >= questions.length) {
-      finishInterview();
+  const handleNext = async () => {
+    if (interviewComplete) {
+      // Don't clear spokenReaction/answer here — that would flash the UI back
+      // to the "Submit Answer" state for a moment before navigating to the
+      // report. Just guard against double-clicks and hand off to finish.
+      if (isFinishing) return;
+      setIsFinishing(true);
+      await finishInterview();
       return;
     }
 
-    await speakText("Alright, let's move to the next question.");
+    answerRef.current = "";
+    setAnswer("");
+    setSpokenReaction("");
 
-    setCurrentIndex(currentIndex + 1);
+    // The next question's own `transition` line (spoken in the effect above,
+    // triggered by currentIndex changing) replaces the old generic phrase here.
+    setCurrentIndex((prev) => prev + 1);
     setTimeout(() => {
       if (isMicOn) startMic();
     }, 500);
 
-   
+
   }
 
   const finishInterview = async () => {
     stopMic()
     setIsMicOn(false)
+
     try {
       const result = await axios.post(ServerUrl+ "/api/interview/finish" , { interviewId} , {withCredentials:true})
 
@@ -297,6 +417,7 @@ setIsSubmitting(false)
       onFinish(result.data)
     } catch (error) {
       console.log(error)
+      setIsFinishing(false)
     }
   }
 
@@ -305,7 +426,7 @@ setIsSubmitting(false)
     if (isIntroPhase) return;
     if (!currentQuestion) return;
 
-    if (timeLeft === 0 && !isSubmitting && !feedback) {
+    if (timeLeft === 0 && !isSubmitting && !spokenReaction) {
       submitAnswer()
     }
   }, [timeLeft]);
@@ -375,13 +496,15 @@ setIsSubmitting(false)
 
             <div className='grid grid-cols-2 gap-6 text-center'>
               <div>
-                <span className='text-2xl font-bold text-emerald-600'>{currentIndex + 1}</span>
-                <span className='text-xs text-gray-400'>Current Questions</span>
+                <span className='text-2xl font-bold text-emerald-600'>
+                  {(currentQuestion?.topicIndex ?? 0) + 1}
+                </span>
+                <span className='text-xs text-gray-400'>Current Topic</span>
               </div>
 
               <div>
-                <span className='text-2xl font-bold text-emerald-600'>{questions.length}</span>
-                <span className='text-xs text-gray-400'>Total Questions</span>
+                <span className='text-2xl font-bold text-emerald-600'>{totalTopics || 5}</span>
+                <span className='text-xs text-gray-400'>Total Topics</span>
               </div>
             </div>
 
@@ -399,7 +522,8 @@ setIsSubmitting(false)
 
           {!isIntroPhase && (<div className='relative mb-6 bg-gray-50 p-4 sm:p-6 rounded-2xl border border-gray-200 shadow-sm'>
             <p className='text-xs sm:text-sm text-gray-400 mb-2'>
-              Question {currentIndex + 1} of {questions.length}
+              Topic {(currentQuestion?.topicIndex ?? 0) + 1} of {totalTopics || 5}
+              {currentQuestion?.isFollowUp ? " · Follow-up" : ""}
             </p>
 
             <div className='text-base sm:text-lg font-semibold text-gray-800 leading-relaxed '>{currentQuestion?.question}</div>
@@ -407,16 +531,21 @@ setIsSubmitting(false)
           }
           <textarea
             placeholder="Type your answer here..."
-            onChange={(e) => setAnswer(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value;
+              answerRef.current = value;
+              setAnswer(value);
+            }}
             value={answer}
             className="flex-1 bg-gray-100 p-4 sm:p-6 rounded-2xl resize-none outline-none border border-gray-200 focus:ring-2 focus:ring-emerald-500 transition text-gray-800" />
 
 
-         {!feedback ? ( <div className='flex items-center gap-4 mt-6'>
+         {!spokenReaction ? ( <div className='flex items-center gap-4 mt-6'>
             <motion.button
               onClick={toggleMic}
               whileTap={{ scale: 0.9 }}
-              className='w-12 h-12 sm:w-14 sm:h-14 flex items-center justify-center rounded-full bg-black text-white shadow-lg'>
+              disabled={isSubmitting}
+              className='w-12 h-12 sm:w-14 sm:h-14 flex items-center justify-center rounded-full bg-black text-white shadow-lg disabled:opacity-50'>
               {isMicOn ? <FaMicrophone size={20} /> : <FaMicrophoneSlash size={20}/>}
             </motion.button>
 
@@ -424,7 +553,7 @@ setIsSubmitting(false)
             onClick={submitAnswer}
             disabled={isSubmitting}
               whileTap={{ scale: 0.95 }}
-              className='flex-1 bg-gradient-to-r from-emerald-600 to-teal-500 text-white py-3 sm:py-4 rounded-2xl shadow-lg hover:opacity-90 transition font-semibold disabled:bg-gray-500'>
+              className='flex-1 bg-gradient-to-r from-emerald-600 to-teal-500 text-white py-3 sm:py-4 rounded-2xl shadow-lg hover:opacity-90 transition font-semibold disabled:bg-gray-500 disabled:cursor-not-allowed'>
               {isSubmitting?"Submitting...":"Submit Answer"}
 
             </motion.button>
@@ -433,14 +562,31 @@ setIsSubmitting(false)
             <motion.div 
              initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-            className='mt-6 bg-emerald-50 border border-emerald-200 p-5 rounded-2xl shadow-sm'>
-              <p className='text-emerald-700 font-medium mb-4'>{feedback}</p>
+            className={`mt-6 border p-5 rounded-2xl shadow-sm ${
+              interviewComplete
+                ? "bg-teal-50 border-teal-200"
+                : "bg-emerald-50 border-emerald-200"
+            }`}>
+              <p className={`font-medium mb-2 ${interviewComplete ? "text-teal-700" : "text-emerald-700"}`}>
+                {spokenReaction}
+              </p>
+
+              {interviewComplete && outro && (
+                <p className='text-teal-600 text-sm mb-4'>{outro}</p>
+              )}
 
               <button
               onClick={handleNext}
+              disabled={isSubmitting || isFinishing}
 
-               className='w-full bg-gradient-to-r from-emerald-600 to-teal-500 text-white py-3 rounded-xl shadow-md hover:opacity-90 transition flex items-center justify-center gap-1'>
-                Next Question <BsArrowRight size={18}/>
+               className={`w-full text-white py-3 rounded-xl shadow-md transition flex items-center justify-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed ${
+                 interviewComplete
+                   ? "bg-gradient-to-r from-teal-600 to-emerald-600 hover:opacity-90"
+                   : "bg-gradient-to-r from-emerald-600 to-teal-500 hover:opacity-90"
+               }`}>
+                {interviewComplete
+                  ? (isFinishing ? "Finishing up..." : "Interview Completed ✓")
+                  : "Next Question"} <BsArrowRight size={18}/>
               </button>
 
             </motion.div>

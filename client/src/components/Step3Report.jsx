@@ -139,12 +139,10 @@ function Step3Report({ report }) {
   autoTable(doc, {
   startY: currentY,
   margin: { left: margin, right: margin },
-  head: [["#", "Question", "Score", "Feedback"]],
+  head: [["Question", "Your Answer & AI Feedback"]],
   body: questionWiseScore.map((q, i) => [
-    `${i + 1}`,
-    q.question,
-    `${q.score}/10`,
-    q.feedback,
+    `Q${i + 1} (${q.score}/10)\n\n${q.question}`,
+    `Your Answer:\n${q.answer && q.answer.trim() !== "" ? q.answer : "No answer was submitted."}\n\nAI Feedback:\n${q.feedback || "No feedback available."}`,
   ]),
   styles: {
     fontSize: 9,
@@ -157,10 +155,8 @@ function Step3Report({ report }) {
     halign: "center",
   },
   columnStyles: {
-    0: { cellWidth: 10, halign: "center" }, // index
-    1: { cellWidth: 55 }, // question
-    2: { cellWidth: 20, halign: "center" }, // score
-    3: { cellWidth: "auto" }, // feedback
+    0: { cellWidth: 50, fontStyle: "bold" }, // question + score
+    1: { cellWidth: "auto" }, // answer + feedback, stacked
   },
   alternateRowStyles: {
     fillColor: [249, 250, 251],
@@ -330,6 +326,17 @@ function Step3Report({ report }) {
                     <div className='bg-green-100 text-green-600 px-3 py-1 rounded-full font-bold text-xs sm:text-sm w-fit'>
                       {q.score ?? 0}/10
                     </div>
+                  </div>
+
+                  <div className='bg-white border border-gray-200 p-4 rounded-lg mb-4'>
+                    <p className='text-xs text-gray-400 font-semibold mb-1'>
+                      Your Answer
+                    </p>
+                    <p className='text-sm text-gray-700 leading-relaxed whitespace-pre-wrap'>
+                      {q.answer && q.answer.trim() !== ""
+                        ? q.answer
+                        : "No answer was submitted for this question."}
+                    </p>
                   </div>
 
                   <div className='bg-green-50 border border-green-200 p-4 rounded-lg'>
