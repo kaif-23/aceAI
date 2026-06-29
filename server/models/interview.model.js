@@ -15,11 +15,21 @@ const questionsSchema = new mongoose.Schema({
     // Spoken aloud immediately after the answer is submitted — short, casual, no scores.
     spokenReaction: String,
     // Rubric-style feedback — saved silently, only ever shown in the Step 3 report.
+    // Now covers: what was good, what was missing, one concrete suggestion.
     feedback: String,
     score: { type: Number, default: 0 },
+    // Field names kept stable for backward compatibility with the existing report
+    // UI/PDF export, but the MEANING of each is now more specific:
+    // confidence    -> "Delivery confidence", derived from time used, filler words,
+    //                  and hedging language in the transcript (text-only signal).
     confidence: { type: Number, default: 0 },
+    // communication -> "Structure & Clarity": is the answer organized and easy to follow.
     communication: { type: Number, default: 0 },
+    // correctness   -> mode-aware: technical accuracy (Technical) or sound judgment/
+    //                  relevance (HR), scored against explicit behavioral anchors.
     correctness: { type: Number, default: 0 },
+    // New: concrete examples/details vs. generic, rehearsed-sounding answers.
+    specificity: { type: Number, default: 0 },
 })
 
 

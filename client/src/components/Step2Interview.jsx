@@ -16,7 +16,12 @@ function Step2Interview({ interviewData, onFinish }) {
   const [isIntroPhase, setIsIntroPhase] = useState(true);
 
   const [isMicOn, setIsMicOn] = useState(true);
-  const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [micError, setMicError] = useState("");
   const [isAIPlaying, setIsAIPlaying] = useState(false);
 
   // The question list now GROWS as the interview proceeds — it starts with only
@@ -51,6 +56,15 @@ function Step2Interview({ interviewData, onFinish }) {
 
   const currentQuestion = questions[currentIndex];
 
+  // Guards against re-running the intro lines when selectedVoice's reference
+  // changes again later (window.speechSynthesis.onvoiceschanged can fire more
+  // than once in several browsers as the voice list keeps populating) — without
+  // this, a second voice-list event during/after the intro would re-trigger this
+  // effect and either re-speak the intro or speak the question twice in a row.
+  const introStartedRef = useRef(false);
+  // Same idea, scoped to "has THIS question index already been spoken" so a
+  // stray selectedVoice change mid-question can't trigger a duplicate.
+  const lastSpokenIndexRef = useRef(-1);
 
   useEffect(() => {
     const loadVoices = () => {
@@ -159,6 +173,12 @@ function Step2Interview({ interviewData, onFinish }) {
     }
     const runIntro = async () => {
       if (isIntroPhase) {
+        // Hard guard: even if this effect re-fires because selectedVoice's
+        // reference changed again (onvoiceschanged can fire more than once),
+        // the intro must only ever be spoken one time.
+        if (introStartedRef.current) return;
+        introStartedRef.current = true;
+
         const introLines = Array.isArray(intro) && intro.length
           ? intro
           : [
@@ -172,6 +192,12 @@ function Step2Interview({ interviewData, onFinish }) {
 
         setIsIntroPhase(false)
       } else if (currentQuestion) {
+        // Same guard as the intro, scoped per-question: prevents this branch
+        // from re-speaking the same question if selectedVoice's reference
+        // changes again while this question is already being asked.
+        if (lastSpokenIndexRef.current === currentIndex) return;
+        lastSpokenIndexRef.current = currentIndex;
+
         await new Promise(r => setTimeout(r, 800));
 
         // Speak this question's transition line (empty for question 1, since
@@ -222,123 +248,187 @@ function Step2Interview({ interviewData, onFinish }) {
 }, [currentIndex]);
 
 
-  // Tracks whether the recognizer is currently active, so stopMicAndWait()
-  // knows whether it actually needs to wait for an onend event at all.
-  const recognitionActiveRef = useRef(false);
+  // Tracks whether the recorder is currently active, mirroring the old
+  // recognitionActiveRef — lets stopMicAndTranscribe() know whether there's
+  // actually anything in-flight worth waiting on.
+  const recordingActiveRef = useRef(false);
 
-  useEffect(() => {
-    if (!("webkitSpeechRecognition" in window)) return;
+  // Lazily creates (once) and returns the mic stream, asking for permission
+  // only the first time it's needed rather than on component mount — this
+  // avoids surprising the user with a permission prompt before the intro
+  // has even finished speaking.
+  const getMicStream = async () => {
+    if (streamRef.current) return streamRef.current;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      setMicError("");
+      return stream;
+    } catch (err) {
+      console.log(err);
+      setMicError("Microphone access was denied. You can still type your answer below.");
+      setIsMicOn(false);
+      return null;
+    }
+  };
 
-    const recognition = new window.webkitSpeechRecognition();
-    recognition.lang = "en-US";
-    recognition.continuous = true;
-    recognition.interimResults = false;
+  const startMic = async () => {
+    if (isAIPlaying) return;
+    if (recordingActiveRef.current) return;
 
-    recognition.onresult = (event) => {
-      const transcript =
-        event.results[event.results.length - 1][0].transcript;
+    const stream = await getMicStream();
+    if (!stream) return;
 
-      // Use the functional form of setAnswer so this always builds on the
-      // LATEST state, never a value captured in a stale closure — this is
-      // what makes typing and speaking safe to interleave. We update the ref
-      // from inside the updater itself, so the ref and state can never
-      // disagree with each other even if multiple updates land in the same tick.
-      setAnswer((prev) => {
-        const next = (prev + " " + transcript).trim();
-        answerRef.current = next;
-        return next;
-      });
-    };
+    try {
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
 
-    recognition.onstart = () => {
-      recognitionActiveRef.current = true;
-    };
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
 
-    recognition.onend = () => {
-      recognitionActiveRef.current = false;
-    };
+      recorder.onstart = () => {
+        recordingActiveRef.current = true;
+        setIsRecording(true);
+      };
 
-    recognitionRef.current = recognition;
+      recorder.onerror = () => {
+        recordingActiveRef.current = false;
+        setIsRecording(false);
+      };
 
-  }, []);
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+    } catch (err) {
+      console.log(err);
+    }
+  };
 
-
-  const startMic = () => {
-    if (recognitionRef.current && !isAIPlaying) {
+  // Stops the recorder WITHOUT transcribing — used when the AI starts
+  // speaking, since whatever was captured up to that point isn't a real
+  // answer and shouldn't be sent for transcription.
+  const stopMic = () => {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recordingActiveRef.current) {
+      recorder.onstop = null;
       try {
-        recognitionRef.current.start();
+        recorder.stop();
       } catch { }
     }
+    recordingActiveRef.current = false;
+    setIsRecording(false);
   };
 
-  const stopMic = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-  };
-
-  // Stops the mic AND waits for any in-flight speech result to actually land
-  // in answerRef before resolving. webkitSpeechRecognition.stop() does not
-  // discard audio already captured — it finishes processing it and still
-  // fires onresult/onend afterward. Submitting immediately after calling
-  // stop() risks sending an answer that's missing the last few words (or is
-  // still completely empty) because that final result hadn't arrived yet.
-  const stopMicAndWait = () => {
+  // Stops the recorder AND transcribes whatever was captured, merging the
+  // result into the existing answer text. This is the MediaRecorder
+  // equivalent of the old stopMicAndWait(): MediaRecorder.stop() is async
+  // (data + onstop fire a moment later), so we wait for that before
+  // uploading, exactly like the old code waited for a final onresult.
+  const stopMicAndTranscribe = () => {
     return new Promise((resolve) => {
-      if (!recognitionRef.current || !recognitionActiveRef.current) {
+      const recorder = mediaRecorderRef.current;
+
+      if (!recorder || !recordingActiveRef.current) {
         resolve();
         return;
       }
 
-      const recognition = recognitionRef.current;
-      const previousOnEnd = recognition.onend;
+      recorder.onstop = async () => {
+        recordingActiveRef.current = false;
+        setIsRecording(false);
 
-      // Give the recognizer a brief grace window to flush a final result
-      // after stop() is called, instead of resolving the instant stop() returns.
-      const settle = () => {
-        recognition.onend = previousOnEnd;
-        setTimeout(resolve, 250);
-      };
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        audioChunksRef.current = [];
 
-      recognition.onend = () => {
-        recognitionActiveRef.current = false;
-        if (previousOnEnd) previousOnEnd();
-        settle();
+        // Don't bother uploading near-empty clips (e.g. user toggled mic on
+        // and off without saying anything) — saves a request and avoids a
+        // confusing "transcription failed" for what was just silence.
+        if (audioBlob.size < 1000) {
+          resolve();
+          return;
+        }
+
+        await transcribeAndAppend(audioBlob);
+        resolve();
       };
 
       try {
-        recognition.stop();
+        recorder.stop();
       } catch {
-        settle();
+        recordingActiveRef.current = false;
+        setIsRecording(false);
+        resolve();
       }
 
-      // Safety net: if onend never fires for some reason, don't hang forever.
-      setTimeout(resolve, 1200);
+      // Safety net: never hang forever if onstop doesn't fire.
+      setTimeout(resolve, 4000);
     });
   };
 
-  const toggleMic = () => {
-    if (isMicOn) {
-      stopMic();
-    } else {
-      startMic();
+  // Uploads the recorded audio to the backend, gets the transcript back,
+  // and merges it into the answer — same merge behavior as the old
+  // onresult handler (appended, not replaced), so multiple start/stop
+  // cycles within one answer all accumulate instead of overwriting.
+  const transcribeAndAppend = async (audioBlob) => {
+    setIsTranscribing(true);
+    setMicError("");
+
+    try {
+      const extension = audioBlob.type.includes("mp4") ? "mp4" : "webm";
+      const formData = new FormData();
+      formData.append("audio", audioBlob, `answer.${extension}`);
+
+      const result = await axios.post(
+        ServerUrl + "/api/interview/transcribe",
+        formData,
+        { withCredentials: true }
+      );
+
+      const transcript = (result.data?.transcript || "").trim();
+
+      if (transcript) {
+        setAnswer((prev) => {
+          const next = (prev + " " + transcript).trim();
+          answerRef.current = next;
+          return next;
+        });
+      } else {
+        setMicError("Couldn't catch that — please try again or type your answer.");
+      }
+    } catch (err) {
+      console.log(err);
+      setMicError("Transcription failed. Please try again or type your answer.");
+    } finally {
+      setIsTranscribing(false);
     }
-    setIsMicOn(!isMicOn);
+  };
+
+  const toggleMic = async () => {
+    if (isMicOn) {
+      await stopMicAndTranscribe();
+    } else {
+      await startMic();
+    }
+    setIsMicOn((prev) => !prev);
   };
 
 
   const submitAnswer = async () => {
-    if (isSubmitting) return;
+    if (isSubmitting || isTranscribing) return;
     setIsSubmitting(true)
 
-    // Wait for any in-flight speech recognition result to land before reading
-    // the final answer — this is what prevents "I definitely said something
-    // but the report shows no answer" when the user finishes speaking right
-    // as they click Submit.
-    await stopMicAndWait();
+    // Wait for any in-flight recording to stop AND be transcribed before
+    // reading the final answer — this is what prevents "I definitely said
+    // something but the report shows no answer" when the user finishes
+    // speaking right as they click Submit.
+    await stopMicAndTranscribe();
     const finalAnswer = answerRef.current.trim();
-    // Reflect the settled value in the UI too, in case a late result arrived
-    // after the last render but before this point.
+    // Reflect the settled value in the UI too, in case a late transcript
+    // arrived after the last render but before this point.
     setAnswer(finalAnswer);
 
     try {
@@ -358,20 +448,31 @@ function Step2Interview({ interviewData, onFinish }) {
         setOutro(finalOutro);
 
         // Speak the reaction to the final answer, then the outro right after,
-        // back-to-back — this is the "interview is actually over" moment, so
-        // it should feel like one continuous closing, not a reaction followed
-        // by silence until a button click later triggers the outro.
+        // back-to-back, then automatically finish and navigate to the report —
+        // no manual "Interview Completed" click needed, this is the natural
+        // end of the conversation.
         (async () => {
           await speakText(result.data.spokenReaction);
           if (finalOutro) await speakText(finalOutro);
+          if (!isFinishing) {
+            setIsFinishing(true);
+            await finishInterview();
+          }
         })();
       } else {
-        speakText(result.data.spokenReaction);
         if (result.data.nextQuestion) {
           // The next question (follow-up OR new topic — decided server-side)
           // is appended now; it didn't exist before this response.
           setQuestions((prev) => [...prev, result.data.nextQuestion]);
         }
+
+        // Speak the reaction, then move on automatically once it's done —
+        // gives the candidate a moment to hear the reaction without needing
+        // a manual "Next Question" click to actually continue.
+        (async () => {
+          await speakText(result.data.spokenReaction);
+          await handleNext();
+        })();
       }
 
       setIsSubmitting(false)
@@ -381,16 +482,24 @@ setIsSubmitting(false)
     }
   }
 
+  // Prevents handleNext from running twice if the auto-advance (after TTS
+  // finishes) and a manual "Skip ahead" click happen to land at nearly the
+  // same time — without this, currentIndex could increment twice in a row.
+  const advancingRef = useRef(false);
+
   const handleNext = async () => {
     if (interviewComplete) {
       // Don't clear spokenReaction/answer here — that would flash the UI back
       // to the "Submit Answer" state for a moment before navigating to the
-      // report. Just guard against double-clicks and hand off to finish.
+      // report. Just guard against double-calls and hand off to finish.
       if (isFinishing) return;
       setIsFinishing(true);
       await finishInterview();
       return;
     }
+
+    if (advancingRef.current) return;
+    advancingRef.current = true;
 
     answerRef.current = "";
     setAnswer("");
@@ -401,6 +510,7 @@ setIsSubmitting(false)
     setCurrentIndex((prev) => prev + 1);
     setTimeout(() => {
       if (isMicOn) startMic();
+      advancingRef.current = false;
     }, 500);
 
 
@@ -433,9 +543,15 @@ setIsSubmitting(false)
 
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-        recognitionRef.current.abort();
+      if (mediaRecorderRef.current && recordingActiveRef.current) {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch { }
+      }
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
       }
 
       window.speechSynthesis.cancel();
@@ -529,8 +645,35 @@ setIsSubmitting(false)
             <div className='text-base sm:text-lg font-semibold text-gray-800 leading-relaxed '>{currentQuestion?.question}</div>
           </div>)
           }
+
+          {isIntroPhase ? (
+            // Nothing is answerable yet — the AI hasn't asked the first question
+            // out loud. Show a calm placeholder instead of a live textarea/mic/
+            // submit, so there's nothing for the candidate to click prematurely
+            // (which previously could submit an empty answer against the real
+            // first question before it had even been asked).
+            <div className='flex-1 flex flex-col'>
+              <div className='flex-1 bg-gray-100 rounded-2xl border border-gray-200 p-4 sm:p-6 flex flex-col gap-3 animate-pulse'>
+                <div className='h-4 bg-gray-200 rounded w-3/4'></div>
+                <div className='h-4 bg-gray-200 rounded w-1/2'></div>
+                <div className='h-4 bg-gray-200 rounded w-2/3'></div>
+              </div>
+              <div className='flex items-center gap-3 mt-6 text-gray-500'>
+                <span className='w-2 h-2 rounded-full bg-emerald-500 animate-pulse'></span>
+                <span className='text-sm font-medium'>
+                  {isAIPlaying ? "Getting ready — listen to the introduction..." : "Getting ready..."}
+                </span>
+              </div>
+              <div
+                aria-hidden="true"
+                className='mt-4 w-full bg-gray-300 text-white py-3 sm:py-4 rounded-2xl font-semibold text-center opacity-50 cursor-not-allowed select-none'>
+                Submit Answer
+              </div>
+            </div>
+          ) : (
+            <>
           <textarea
-            placeholder="Type your answer here..."
+            placeholder="Type your answer here, or use the mic..."
             onChange={(e) => {
               const value = e.target.value;
               answerRef.current = value;
@@ -539,22 +682,41 @@ setIsSubmitting(false)
             value={answer}
             className="flex-1 bg-gray-100 p-4 sm:p-6 rounded-2xl resize-none outline-none border border-gray-200 focus:ring-2 focus:ring-emerald-500 transition text-gray-800" />
 
+          {(isRecording || isTranscribing || micError) && (
+            <div className='mt-3 flex items-center gap-2 text-sm'>
+              {isRecording && (
+                <span className='flex items-center gap-2 text-rose-600 font-medium'>
+                  <span className='w-2 h-2 rounded-full bg-rose-600 animate-pulse'></span>
+                  Listening...
+                </span>
+              )}
+              {isTranscribing && (
+                <span className='text-emerald-600 font-medium'>Transcribing your answer...</span>
+              )}
+              {micError && !isRecording && !isTranscribing && (
+                <span className='text-amber-600'>{micError}</span>
+              )}
+            </div>
+          )}
+
 
          {!spokenReaction ? ( <div className='flex items-center gap-4 mt-6'>
             <motion.button
               onClick={toggleMic}
               whileTap={{ scale: 0.9 }}
-              disabled={isSubmitting}
-              className='w-12 h-12 sm:w-14 sm:h-14 flex items-center justify-center rounded-full bg-black text-white shadow-lg disabled:opacity-50'>
+              disabled={isSubmitting || isTranscribing}
+              className={`w-12 h-12 sm:w-14 sm:h-14 flex items-center justify-center rounded-full text-white shadow-lg disabled:opacity-50 transition ${
+                isRecording ? "bg-rose-600" : "bg-black"
+              }`}>
               {isMicOn ? <FaMicrophone size={20} /> : <FaMicrophoneSlash size={20}/>}
             </motion.button>
 
             <motion.button
             onClick={submitAnswer}
-            disabled={isSubmitting}
+            disabled={isSubmitting || isTranscribing}
               whileTap={{ scale: 0.95 }}
               className='flex-1 bg-gradient-to-r from-emerald-600 to-teal-500 text-white py-3 sm:py-4 rounded-2xl shadow-lg hover:opacity-90 transition font-semibold disabled:bg-gray-500 disabled:cursor-not-allowed'>
-              {isSubmitting?"Submitting...":"Submit Answer"}
+              {isSubmitting ? "Submitting..." : isTranscribing ? "Transcribing..." : "Submit Answer"}
 
             </motion.button>
 
@@ -585,11 +747,17 @@ setIsSubmitting(false)
                    : "bg-gradient-to-r from-emerald-600 to-teal-500 hover:opacity-90"
                }`}>
                 {interviewComplete
-                  ? (isFinishing ? "Finishing up..." : "Interview Completed ✓")
-                  : "Next Question"} <BsArrowRight size={18}/>
+                  ? (isFinishing ? "Finishing up..." : "Continue to report")
+                  : "Skip ahead"} <BsArrowRight size={18}/>
               </button>
 
+              <p className='text-xs text-gray-400 text-center mt-2'>
+                {interviewComplete ? "Wrapping up automatically..." : "Moving to the next question automatically..."}
+              </p>
+
             </motion.div>
+          )}
+            </>
           )}
         </div>
       </div>
